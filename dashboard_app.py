@@ -4,6 +4,8 @@ import time
 from web3 import Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
 from telegram import Bot
+from collections import deque
+import pandas as pd
 
 # ---------------- Configuration ----------------
 TOKEN = "7494163279:AAHIXZkCLLuaSeWMtLwRfH6dkzTiJ46l6RE"
@@ -17,6 +19,7 @@ AUTO_FUND_WEI = Web3.to_wei(1, "ether")  # 1 ETH if needed
 
 GAS_THRESHOLD = 200
 TEMP_THRESHOLD = 40
+MAX_HISTORY = 50  # max readings to show in charts
 # ------------------------------------------------
 
 def normalize_privkey(pk: str) -> str:
@@ -32,7 +35,8 @@ async def send_telegram_alert(message: str):
 w3 = Web3(Web3.HTTPProvider(GANACHE_RPC))
 w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
-st.title("Smart Sensor Alert System Dashboard (Simulation)")
+st.set_page_config(page_title="Smart Sensor Dashboard", layout="wide")
+st.title("🚨 Smart Sensor Alert System Dashboard (Simulation)")
 
 if not w3.is_connected():
     st.error("❌ Cannot connect to Ganache RPC. Make sure Ganache GUI is running on port 7545.")
@@ -41,100 +45,87 @@ st.success("✅ Connected to Ganache blockchain")
 
 TARGET_PRIVATE_KEY = normalize_privkey(TARGET_PRIVATE_KEY)
 
-col1, col2 = st.columns(2)
-with col1:
-    st.write("**Target account**")
-    st.write(TARGET_ACCOUNT)
-with col2:
-    try:
-        bal = w3.eth.get_balance(TARGET_ACCOUNT)
-        st.write("Balance:", f"{w3.from_wei(bal, 'ether')} ETH")
-    except Exception as e:
-        st.write("Balance: error", e)
+# ------------------ State ------------------
+if 'gas_history' not in st.session_state:
+    st.session_state.gas_history = deque(maxlen=MAX_HISTORY)
+if 'temp_history' not in st.session_state:
+    st.session_state.temp_history = deque(maxlen=MAX_HISTORY)
+if 'alert_state' not in st.session_state:
+    st.session_state.alert_state = False
+if 'alert_history' not in st.session_state:
+    st.session_state.alert_history = []
 
-st.markdown("---")
-st.subheader("Simulated Sensors")
+# ------------------ Layout Tabs ------------------
+tab1, tab2, tab3 = st.tabs(["Sensors", "Alerts History", "Blockchain Logs"])
 
-gas_value = st.slider("Gas Level", 0, 500, 100)
-temp_value = st.slider("Temperature (°C)", 20, 50, 30)
-tilt_status = st.selectbox("Tilt Status", ["Stable", "Tilt Detected"])
+with tab1:
+    st.subheader("⚙️ Sensor Simulation")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        gas_value = st.slider("Gas Level", 0, 500, 100)
+    with col2:
+        temp_value = st.slider("Temperature (°C)", 20, 50, 30)
+    with col3:
+        tilt_status = st.selectbox("Tilt Status", ["Stable", "Tilt Detected"])
 
-# Check conditions
-alert_triggered = False
-alert_message = ""
-if gas_value > GAS_THRESHOLD:
-    alert_triggered = True
-    alert_message += f"🚨 Gas Leak Detected! Level: {gas_value}\n"
-if temp_value > TEMP_THRESHOLD:
-    alert_triggered = True
-    alert_message += f"🔥 High Temperature: {temp_value}°C\n"
-if tilt_status == "Tilt Detected":
-    alert_triggered = True
-    alert_message += "⚠️ Tilt Detected! Possible instability.\n"
+    # Update history
+    st.session_state.gas_history.append(gas_value)
+    st.session_state.temp_history.append(temp_value)
 
-# Handle alert
-if alert_triggered:
-    st.warning("⚠ Alert Active! Sending Telegram message & saving blockchain record...")
-    asyncio.run(send_telegram_alert(alert_message))
-    st.success("✅ Telegram alert sent!")
+    # Live charts
+    st.line_chart(pd.DataFrame({"Gas": list(st.session_state.gas_history)}))
+    st.line_chart(pd.DataFrame({"Temperature": list(st.session_state.temp_history)}))
 
-    try:
-        target_balance = w3.eth.get_balance(TARGET_ACCOUNT)
-        st.write(f"Target balance before tx: {w3.from_wei(target_balance, 'ether')} ETH")
+    # Check alert
+    alert_triggered = False
+    alert_message = ""
+    if gas_value > GAS_THRESHOLD:
+        alert_triggered = True
+        alert_message += f"🚨 Gas Leak Detected! Level: {gas_value}\n"
+    if temp_value > TEMP_THRESHOLD:
+        alert_triggered = True
+        alert_message += f"🔥 High Temperature: {temp_value}°C\n"
+    if tilt_status == "Tilt Detected":
+        alert_triggered = True
+        alert_message += "⚠️ Tilt Detected! Possible instability.\n"
 
-        if target_balance < w3.to_wei(0.001, "ether"):
-            st.info("Target account balance low. Funding from Ganache account[0]...")
-            funder = w3.eth.accounts[0]
-            tx_fund = {
-                "from": funder,
-                "to": TARGET_ACCOUNT,
-                "value": AUTO_FUND_WEI,
-                "gas": 21000,
-                "gasPrice": w3.to_wei("1", "gwei")
-            }
-            tx_hash_fund = w3.eth.send_transaction(tx_fund)
-            st.write("Funding tx sent:", tx_hash_fund.hex())
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash_fund, timeout=120)
-            st.success("✅ Funding transaction mined.")
-            time.sleep(1)
-            target_balance = w3.eth.get_balance(TARGET_ACCOUNT)
-            st.write(f"Target balance after funding: {w3.from_wei(target_balance, 'ether')} ETH")
+    # Alert notification logic
+    if alert_triggered and not st.session_state.alert_state:
+        st.session_state.alert_state = True
+        asyncio.run(send_telegram_alert(alert_message))
+        st.success("⚠️ Alert triggered! Telegram notification sent.")
+        st.session_state.alert_history.append({"Time": time.strftime("%H:%M:%S"), "Type": "Alert", "Message": alert_message})
+    elif not alert_triggered and st.session_state.alert_state:
+        # back to normal
+        st.session_state.alert_state = False
+        back_normal_msg = "✅ All safe now."
+        asyncio.run(send_telegram_alert(back_normal_msg))
+        st.success("Sensors normalized. Telegram notification sent.")
+        st.session_state.alert_history.append({"Time": time.strftime("%H:%M:%S"), "Type": "Normal", "Message": back_normal_msg})
+    else:
+        st.info("✅ All sensors stable." if not alert_triggered else "⚠ Alert ongoing.")
 
-        if target_balance >= w3.to_wei(0.0001, "ether"):
-            nonce = w3.eth.get_transaction_count(TARGET_ACCOUNT)
-            tx = {
-                "nonce": nonce,
-                "to": TARGET_ACCOUNT,
-                "value": 0,
-                "gas": 21000,
-                "gasPrice": w3.to_wei("1", "gwei"),
-                "chainId": w3.eth.chain_id
-            }
-            signed = w3.eth.account.sign_transaction(tx, private_key=TARGET_PRIVATE_KEY)
-            raw_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            st.success(f"✅ Blockchain record saved: {raw_hash.hex()}")
-        else:
-            st.error("❌ Insufficient funds to pay gas. Please fund target manually in Ganache.")
-    except Exception as e:
-        st.error(f"❌ Transaction error: {e}")
-else:
-    st.success("✅ All sensors normal and stable.")
+with tab2:
+    st.subheader("📋 Alerts History")
+    if st.session_state.alert_history:
+        st.table(pd.DataFrame(st.session_state.alert_history))
+    else:
+        st.info("No alerts yet.")
 
-# -------- Live transactions display --------
-st.markdown("---")
-st.subheader("Live Blockchain Transactions")
-
-def display_all_transactions():
+with tab3:
+    st.subheader("📜 Blockchain Transactions")
     tx_lines = []
     for block_num in range(w3.eth.block_number + 1):
         block = w3.eth.get_block(block_num, full_transactions=True)
         for tx in block.transactions:
-            tx_lines.append(
-                f"Block {block_num} | Tx Hash: {tx.hash.hex()} | From: {tx['from']} | To: {tx['to']} | Value: {w3.from_wei(tx['value'], 'ether')} ETH"
-            )
+            tx_lines.append({
+                "Block": block_num,
+                "Tx Hash": tx.hash.hex(),
+                "From": tx['from'],
+                "To": tx['to'],
+                "Value (ETH)": float(w3.from_wei(tx['value'], 'ether'))
+            })
     if tx_lines:
-        st.text("\n".join(tx_lines))
+        st.table(pd.DataFrame(tx_lines))
     else:
-        st.text("No transactions yet.")
-
-display_all_transactions()
+        st.info("No transactions yet.")
